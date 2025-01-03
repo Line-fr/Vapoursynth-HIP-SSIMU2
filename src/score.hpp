@@ -32,6 +32,37 @@ __device__ __host__ void frontierreduce(int w[7], int reduction){
     w[6] = 0; for (int i = 0; i < 6; i++) w[6] += w[i];
 }
 
+__device__ __host__ int2 getfrontcoo(int w[7], int x){
+    int2 res;
+    res.x = 0;
+    res.y = x;
+    while (res.x < 6 && w[res.x] <= res.y){
+        res.y -= w[res.x];
+        res.x++;
+    }
+    return res;
+}
+
+__device__ __host__ inline int getfrontblock(int w[7], int threadnum, int x){
+    int sumnum = 0;
+    int offset = 0;
+    int rem;
+    for (int i = 0; i < 6; i++){
+        rem = w[i];
+        if (x < threadnum-offset) return sumnum;
+        if (offset > 0) sumnum++; //skip first block
+        x -= offset;
+        rem -= offset; 
+        if (x < rem){
+            return sumnum + rem/threadnum;
+        }
+        sumnum += (rem-1)/threadnum + 1;
+        offset = threadnum - rem%threadnum; //new offset
+        x -= rem;
+    }
+    return 0;
+}
+
 __global__ void frontierSumReduce_kernel(float3* dst, float3* src, int w0, int w1, int w2, int w3, int w4, int w5, int w6){
     //dst must be of size 6*sizeof(float3)*blocknum at least
     //shared memory needed is 6*sizeof(float3)*threadnum at least
@@ -41,12 +72,10 @@ __global__ void frontierSumReduce_kernel(float3* dst, float3* src, int w0, int w
 
     int w[7] = {w0, w1, w2, w3, w4, w5, 0};
     //first let s get the left frontier from us
-    int front_ind = 0;
-    int front_x = x;
-    while (front_ind < 6 && w[front_ind] <= front_x){
-        front_x -= w[front_ind];
-        front_ind++;
-    }
+    int2 frontcoo = getfrontcoo(w, x);
+    int front_ind = frontcoo.x;
+    int front_x = frontcoo.y;
+    
     int max_front_x = min(w[front_ind], front_x - thx + threadnum);
     int min_front_x = max(0, front_x - thx);
 
@@ -109,7 +138,8 @@ __global__ void frontierSumReduce_kernel(float3* dst, float3* src, int w0, int w
     for (int i = 0; i < front_ind; i++){
         sumnum += w[i];
     }
-    if ((front_x-thx)%threadnum != 0) sumnum += 1;
+    if (sumnum%threadnum != 0) sumnum += 1;
+    if (front_x < thx) sumnum--;
     sumnum += (front_x-thx)/threadnum;
     if (front_ind < 6 && front_x == min_front_x){
         dst[sumnum] = sumssim1[thx];
@@ -138,12 +168,10 @@ __global__ void frontierAllscore_map_Kernel(float3* dst, float3* im1, float3* im
     w[6] = 0;
 
     //first let s get the left frontier from us
-    int front_ind = 0;
-    int front_x = x;
-    while (front_ind < 6 && w[front_ind] <= front_x){
-        front_x -= w[front_ind];
-        front_ind++;
-    }
+    int2 frontcoo = getfrontcoo(w, x);
+    int front_ind = frontcoo.x;
+    int front_x = frontcoo.y;
+
     int max_front_x = min(w[front_ind], front_x - thx + threadnum);
     int min_front_x = max(0, front_x - thx);
 
@@ -209,13 +237,7 @@ __global__ void frontierAllscore_map_Kernel(float3* dst, float3* im1, float3* im
         next *= 2;
         __syncthreads();
     }
-    int sumnum = 0;
-    frontierreduce(w, threadnum);
-    for (int i = 0; i < front_ind; i++){
-        sumnum += w[i];
-    }
-    if ((min_front_x)%threadnum != 0) sumnum += 1;
-    sumnum += (min_front_x)/threadnum;
+    int sumnum = getfrontblock(w, threadnum, x);
     if (front_ind < 6 && front_x == min_front_x){
         dst[sumnum] = sumssim1[thx];
         dst[w[6] + sumnum] = sumssim4[thx];
