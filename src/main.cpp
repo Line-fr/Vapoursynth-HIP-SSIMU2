@@ -188,12 +188,10 @@ double ssimu2process(const uint8_t *srcp1[3], const uint8_t *srcp2[3], int strid
     gaussianBlur(src1_d, tempb1_d, temp_d, totalscalesize, width, height, gaussiankernel, stream);
     gaussianBlur(src2_d, tempb2_d, temp_d, totalscalesize, width, height, gaussiankernel, stream);
 
-    //step 4 : ssim map
-    
-    //step 5 : edge diff map    
+    //step 4 : get all scores from our matrices
     std::vector<float3> allscore_res = allscore_map(src1_d, src2_d, tempb1_d, tempb2_d, temps11_d, temps22_d, temps12_d, temp_d, width, height, maxshared, event_d, stream);
 
-    //step 6 : format the vector
+    //step 5 : format the vector
     std::vector<float> measure_vec(108);
 
     for (int plane = 0; plane < 3; plane++){
@@ -208,7 +206,7 @@ double ssimu2process(const uint8_t *srcp1[3], const uint8_t *srcp2[3], int strid
         }
     }
 
-    //step 7 : enjoy !
+    //step 6 : enjoy !
     const float ssim = final_score(measure_vec);
 
     hipEventRecord(event_d, stream); //place an event in the stream at the end of all our operations

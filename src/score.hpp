@@ -8,12 +8,49 @@ __device__ __host__ float3 tothe4th(float3 x){
     return y*y;
 }
 
-__global__ void sumreduce(float3* dst, float3* src, int bl_x){
+__device__ __host__ void frontierreduce(int w[7], int reduction){
+    int old[7];
+    for (int i = 0; i < 7; i++) old[i] = w[i];
+
+    int sum = 0;
+    w[0] = (old[0] - 1)/reduction + 1;
+    sum += old[0];
+    w[1] = (old[1] - (reduction - sum%reduction) - 1)/reduction + 2;
+    if (old[1] < reduction - sum%reduction) w[1] = 1;
+    sum += old[1];
+    w[2] = (old[2] - (reduction - sum%reduction) - 1)/reduction + 2;
+    if (old[2] < reduction - sum%reduction) w[2] = 1;
+    sum += old[2];
+    w[3] = (old[3] - (reduction - sum%reduction) - 1)/reduction + 2;
+    if (old[3] < reduction - sum%reduction) w[3] = 1;
+    sum += old[3];
+    w[4] = (old[4] - (reduction - sum%reduction) - 1)/reduction + 2;
+    if (old[4] < reduction - sum%reduction) w[4] = 1;
+    sum += old[4];
+    w[5] = (old[5] - (reduction - sum%reduction) - 1)/reduction + 2;
+    if (old[5] < reduction - sum%reduction) w[5] = 1;
+    w[6] = 0; for (int i = 0; i < 6; i++) w[6] += w[i];
+}
+
+__global__ void frontierSumReduce_kernel(float3* dst, float3* src, int w0, int w1, int w2, int w3, int w4, int w5, int w6){
     //dst must be of size 6*sizeof(float3)*blocknum at least
     //shared memory needed is 6*sizeof(float3)*threadnum at least
     const int x = threadIdx.x + blockIdx.x*blockDim.x;
     const int thx = threadIdx.x;
     const int threadnum = blockDim.x;
+
+    int w[7] = {w0, w1, w2, w3, w4, w5, 0};
+    //first let s get the left frontier from us
+    int front_ind = 0;
+    int front_x = x;
+    while (front_ind < 6 && w[front_ind] <= front_x){
+        front_x -= w[front_ind];
+        front_ind++;
+    }
+    int max_front_x = min(w[front_ind], front_x - thx + threadnum);
+    int min_front_x = max(0, front_x - thx);
+
+    __syncthreads();
     
     extern __shared__ float3 sharedmem[];
     float3* sumssim1 = sharedmem; //size sizeof(float3)*threadnum
@@ -23,7 +60,7 @@ __global__ void sumreduce(float3* dst, float3* src, int bl_x){
     float3* sumd1 = sharedmem+4*blockDim.x; //size sizeof(float3)*threadnum
     float3* sumd4 = sharedmem+5*blockDim.x; //size sizeof(float3)*threadnum
 
-    if (x >= bl_x){
+    if (front_ind > 5){
         sumssim1[thx].x = 0;
         sumssim4[thx].x = 0;
         suma1[thx].x = 0;
@@ -46,17 +83,17 @@ __global__ void sumreduce(float3* dst, float3* src, int bl_x){
         sumd4[thx].z = 0;
     } else {
         sumssim1[thx] = src[x];
-        sumssim4[thx] = src[x + bl_x];
-        suma1[thx] = src[x + 2*bl_x];
-        suma4[thx] = src[x + 3*bl_x];
-        sumd1[thx] = src[x + 4*bl_x];
-        sumd4[thx] = src[x + 5*bl_x];
+        sumssim4[thx] = src[x + w6];
+        suma1[thx] = src[x + 2*w6];
+        suma4[thx] = src[x + 3*w6];
+        sumd1[thx] = src[x + 4*w6];
+        sumd4[thx] = src[x + 5*w6];
     }
     __syncthreads();
     //now we need to do some pointer jumping to regroup every block sums;
     int next = 1;
     while (next < threadnum){
-        if (thx + next < threadnum && (thx%(next*2) == 0)){
+        if (thx + next < threadnum && front_x + next < max_front_x && (thx%(next*2) == 0)){
             sumssim1[thx] += sumssim1[thx+next];
             sumssim4[thx] += sumssim4[thx+next];
             suma1[thx] += suma1[thx+next];
@@ -67,22 +104,50 @@ __global__ void sumreduce(float3* dst, float3* src, int bl_x){
         next *= 2;
         __syncthreads();
     }
-    if (thx == 0){
-        dst[blockIdx.x] = sumssim1[0];
-        dst[gridDim.x + blockIdx.x] = sumssim4[0];
-        dst[2*gridDim.x + blockIdx.x] = suma1[0];
-        dst[3*gridDim.x + blockIdx.x] = suma4[0];
-        dst[4*gridDim.x + blockIdx.x] = sumd1[0];
-        dst[5*gridDim.x + blockIdx.x] = sumd4[0];
+    int sumnum = 0;
+    frontierreduce(w, threadnum);
+    for (int i = 0; i < front_ind; i++){
+        sumnum += w[i];
+    }
+    if ((front_x-thx)%threadnum != 0) sumnum += 1;
+    sumnum += (front_x-thx)/threadnum;
+    if (front_ind < 6 && front_x == min_front_x){
+        dst[sumnum] = sumssim1[thx];
+        dst[w[6] + sumnum] = sumssim4[thx];
+        dst[2*w[6] + sumnum] = suma1[thx];
+        dst[3*w[6] + sumnum] = suma4[thx];
+        dst[4*w[6] + sumnum] = sumd1[thx];
+        dst[5*w[6] + sumnum] = sumd4[thx];
     }
 }
 
-__global__ void allscore_map_Kernel(float3* dst, float3* im1, float3* im2, float3* mu1, float3* mu2, float3* s11, float3* s22, float3* s12, int width, int height){
+__global__ void frontierAllscore_map_Kernel(float3* dst, float3* im1, float3* im2, float3* mu1, float3* mu2, float3* s11, float3* s22, float3* s12, int width, int height){
     //dst must be of size 6*sizeof(float3)*blocknum at least
     //shared memory needed is 6*sizeof(float3)*threadnum at least
     const int x = threadIdx.x + blockIdx.x*blockDim.x;
     const int thx = threadIdx.x;
     const int threadnum = blockDim.x;
+
+    int w[7];
+    int he = height; int we = width;
+    for (int i = 0; i < 6; i++){
+        w[i] = he*we;
+        he = (he -1)/2 + 1;
+        we = (we -1)/2 + 1;
+    }
+    w[6] = 0;
+
+    //first let s get the left frontier from us
+    int front_ind = 0;
+    int front_x = x;
+    while (front_ind < 6 && w[front_ind] <= front_x){
+        front_x -= w[front_ind];
+        front_ind++;
+    }
+    int max_front_x = min(w[front_ind], front_x - thx + threadnum);
+    int min_front_x = max(0, front_x - thx);
+
+    __syncthreads();
     
     extern __shared__ float3 sharedmem[];
     float3* sumssim1 = sharedmem; //size sizeof(float3)*threadnum
@@ -94,7 +159,7 @@ __global__ void allscore_map_Kernel(float3* dst, float3* im1, float3* im2, float
     
 
     float3 d0, d1, d2;
-    if (x < width*height){
+    if (front_ind <= 5){
         //ssim
         const float3 m1 = mu1[x]; const float3 m2 = mu2[x];
         const float3 m11 = m1*m1;
@@ -133,7 +198,7 @@ __global__ void allscore_map_Kernel(float3* dst, float3* im1, float3* im2, float
     //now we need to do some pointer jumping to regroup every block sums;
     int next = 1;
     while (next < threadnum){
-        if (thx + next < threadnum && (thx%(next*2) == 0)){
+        if (thx + next < threadnum && front_x + next < max_front_x && (thx%(next*2) == 0)){
             sumssim1[thx] += sumssim1[thx+next];
             sumssim4[thx] += sumssim4[thx+next];
             suma1[thx] += suma1[thx+next];
@@ -144,13 +209,20 @@ __global__ void allscore_map_Kernel(float3* dst, float3* im1, float3* im2, float
         next *= 2;
         __syncthreads();
     }
-    if (thx == 0){
-        dst[blockIdx.x] = sumssim1[0]/(width*height);
-        dst[gridDim.x + blockIdx.x] = sumssim4[0]/(width*height);
-        dst[2*gridDim.x + blockIdx.x] = suma1[0]/(width*height);
-        dst[3*gridDim.x + blockIdx.x] = suma4[0]/(width*height);
-        dst[4*gridDim.x + blockIdx.x] = sumd1[0]/(width*height);
-        dst[5*gridDim.x + blockIdx.x] = sumd4[0]/(width*height);
+    int sumnum = 0;
+    frontierreduce(w, threadnum);
+    for (int i = 0; i < front_ind; i++){
+        sumnum += w[i];
+    }
+    if ((min_front_x)%threadnum != 0) sumnum += 1;
+    sumnum += (min_front_x)/threadnum;
+    if (front_ind < 6 && front_x == min_front_x){
+        dst[sumnum] = sumssim1[thx];
+        dst[w[6] + sumnum] = sumssim4[thx];
+        dst[2*w[6] + sumnum] = suma1[thx];
+        dst[3*w[6] + sumnum] = suma4[thx];
+        dst[4*w[6] + sumnum] = sumd1[thx];
+        dst[5*w[6] + sumnum] = sumd4[thx];
     }
 }
 
@@ -163,35 +235,49 @@ std::vector<float3> allscore_map(float3* im1, float3* im2, float3* mu1, float3* 
     int h = baseheight;
     int th_x;
     int bl_x;
-    int index = 0;
-    std::vector<int> scaleoutdone(7);
-    scaleoutdone[0] = 0;
-    for (int scale = 0; scale < 6; scale++){
-        th_x = std::min((const int)(maxshared/(6*sizeof(float3)))/32*32, std::min(1024, w*h));
-        bl_x = (w*h-1)/th_x + 1;
-        int blr_x = bl_x;
-        allscore_map_Kernel<<<dim3(bl_x), dim3(th_x), 6*sizeof(float3)*th_x, stream>>>(temp+scaleoutdone[scale]+((blr_x >= th_x) ? 6*bl_x : 0), im1+index, im2+index, mu1+index, mu2+index, s11+index, s22+index, s12+index, w, h);
-        //printf("I got %s with %d\n", hipGetErrorString(hipGetLastError()), 6*sizeof(float3)*th_x);
-        GPU_CHECK(hipGetLastError());
-
-        int oscillate = 0; //3 sets of memory: real destination at 0, first at 6*bl_x for oscillate 0 and last at 12*bl_x for oscillate 1;
-        int oldblr_x = bl_x;
-        while (blr_x >= th_x){
-            blr_x = (bl_x -1)/th_x + 1;
-            //sum reduce
-            sumreduce<<<dim3(blr_x), dim3(th_x), 6*sizeof(float3)*th_x, stream>>>(temp+scaleoutdone[scale]+((blr_x >= th_x) ? (oscillate+1)*6*bl_x : 0), temp+scaleoutdone[scale]+ (oscillate+1)*6*bl_x, oldblr_x);
-            oscillate ^= 1;
-            oldblr_x = blr_x;
-        }
-
-        scaleoutdone[scale+1] = scaleoutdone[scale]+6*blr_x;
-        index += w*h;
+    int sizes[7];
+    sizes[6] = 0;
+    for (int i = 0; i < 6; i++){
+        sizes[i] = w*h;
+        sizes[6] += w*h;
         w = (w-1)/2+1;
         h = (h-1)/2+1;
     }
+
+    int sizebeforetransfer = 4096000000/6;
+    th_x = std::min((const int)(maxshared/(6*sizeof(float3)))/32*32, std::min(1024, sizes[6]));
+    bl_x = (sizes[6]-1)/th_x + 1;
+
+    int copysizes[7]; for (int i = 0; i < 7; i++) copysizes[i] = sizes[i];
+    frontierreduce(copysizes, th_x);
+    int pad = 6*copysizes[6];
+
+    frontierAllscore_map_Kernel<<<dim3(bl_x), dim3(th_x), 6*sizeof(float3)*th_x, stream>>>(temp+((copysizes[6] > sizebeforetransfer) ? pad : 0), im1, im2, mu1, mu2, s11, s22, s12, basewidth, baseheight);
+    //GPU_CHECK(hipGetLastError());
+    frontierreduce(sizes, th_x);
+
+    int oscillate = 0; // next is -> for 0 and 1 is <-
+    while (sizes[6] > sizebeforetransfer){
+        th_x = std::min((const int)(maxshared/(6*sizeof(float3)))/32*32, std::min(1024, sizes[6]));
+        bl_x = (sizes[6]-1)/th_x + 1;
+
+        frontierreduce(copysizes, th_x);
+
+        frontierSumReduce_kernel<<<dim3(bl_x), dim3(th_x), 6*sizeof(float3)*th_x, stream>>>(temp+((copysizes[6] > sizebeforetransfer) ? (2-oscillate)*pad : 0), temp+ (1+oscillate)*pad, sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], sizes[5], sizes[6]);
+        //GPU_CHECK(hipGetLastError());
+
+        frontierreduce(sizes, th_x);
+        oscillate ^= 1;
+    }
+
+    std::vector<int> scaleoutdone(7);
+    scaleoutdone[0] = 0;
+    for (int i = 0; i < 6; i++){
+        scaleoutdone[i+1] = scaleoutdone[i] + 6*sizes[i];
+    }
+    
     float3* hostback = (float3*)malloc(sizeof(float3)*scaleoutdone[6]);
     GPU_CHECK(hipMemcpyDtoHAsync(hostback, (hipDeviceptr_t)temp, sizeof(float3)*scaleoutdone[6], stream));
-    //the data as already been reduced by a factor of 512 which can now be reasonably retrieved from GPU
 
     hipEventRecord(event_d, stream); //place an event in the stream at the end of all our operations
     hipEventSynchronize(event_d);
